@@ -8,59 +8,127 @@ import warnings
 import re
 import os
 import time
+import csv
+import random
 from tqdm import tqdm
 warnings.filterwarnings("ignore")
 
-# Load a model with longer context window
-print("Loading model and tokenizer...")
-model_name = "mediocredev/open-llama-3b-v2-instruct"
-tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir='./cache')
-model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir='./cache', torch_dtype=torch.bfloat16).to('cuda')
+# Load models for query decomposition and response generation
+print("Loading models and tokenizers...")
+# Model for query decomposition
+decomp_model_name = "mediocredev/open-llama-3b-v2-instruct"  # You can replace with fine-tuned Llama/Qwen
+decomp_tokenizer = AutoTokenizer.from_pretrained(decomp_model_name, cache_dir='./cache')
+decomp_model = AutoModelForCausalLM.from_pretrained(decomp_model_name, cache_dir='./cache', torch_dtype=torch.bfloat16).to('cuda')
+
+# Model for response generation
+gen_model_name = "mediocredev/open-llama-3b-v2-instruct"  # You can replace with fine-tuned Llama/Qwen
+gen_tokenizer = AutoTokenizer.from_pretrained(gen_model_name, cache_dir='./cache')
+gen_model = AutoModelForCausalLM.from_pretrained(gen_model_name, cache_dir='./cache', torch_dtype=torch.bfloat16).to('cuda')
 
 # Set token limits for context
-MAX_TOKENS = 1000  # Reduced from 1500 to be well under model's 2048 token limit
-TOKEN_MARGIN = 300  # Increased safety margin
+MAX_TOKENS = 1000
+TOKEN_MARGIN = 300
 
-pipeline = transformers.pipeline(
+# Create pipelines for decomposition and generation
+decomp_pipeline = transformers.pipeline(
     'text-generation',
-    model=model,
-    tokenizer=tokenizer,
+    model=decomp_model,
+    tokenizer=decomp_tokenizer,
     torch_dtype=torch.bfloat16,
     device_map='auto',
 )
 
-def generate_search_query(user_input):
-    System_prompt = "Convert the user's input into a search query suitable for web search."
-    prompt = f'{System_prompt} Convert my following content into a search query suitable for web search: {user_input}'
+gen_pipeline = transformers.pipeline(
+    'text-generation',
+    model=gen_model,
+    tokenizer=gen_tokenizer,
+    torch_dtype=torch.bfloat16,
+    device_map='auto',
+)
+
+def decompose_query(user_input):
+    """
+    Analyzes complex user queries and breaks them down into optimized search terms
+    """
+    # Simplified prompt to get better results
+    System_prompt = "Your task is to convert this question into 3-5 keywords for a web search engine."
+    prompt = f'{System_prompt}\n\nQuestion: {user_input}\n\nSearch keywords:'
     
-    tokens = len(tokenizer.encode(prompt))
-    print(f"Prompt length: {tokens} tokens")
+    tokens = len(decomp_tokenizer.encode(prompt))
+    print(f"Decomposition prompt length: {tokens} tokens")
     
     if tokens > MAX_TOKENS:
         print(f"Warning: Input too long ({tokens} tokens), truncating...")
-        # Truncate the input to fit within token limits
-        truncated_input = tokenizer.decode(tokenizer.encode(user_input)[:MAX_TOKENS-100])
-        prompt = f'{System_prompt} Convert my following content into a search query suitable for web search: {truncated_input}'
+        truncated_input = decomp_tokenizer.decode(decomp_tokenizer.encode(user_input)[:MAX_TOKENS-150])
+        prompt = f'{System_prompt}\n\nQuestion: {truncated_input}\n\nSearch keywords:'
     
     try:
-        response = pipeline(
+        response = decomp_pipeline(
             prompt,
             max_new_tokens=100,
             repetition_penalty=1.05,
         )
         response = response[0]['generated_text']
-        result = response.split('</s>')[1].strip()
+        # Extract the generated search terms
+        if 'Search keywords:' in response:
+            result = response.split('Search keywords:')[1].split('</s>')[0].strip()
+        else:
+            # Fallback extraction if the model doesn't follow the exact format
+            result = response.split(user_input)[1].split('</s>')[0].strip()
+            
+        # If result is empty or too short, create a basic query from the question
+        if not result or len(result) < 5:
+            # Extract key nouns from the question
+            words = user_input.split()
+            # Remove common stop words and keep nouns/important words
+            important_words = [w for w in words if len(w) > 3 and w.lower() not in 
+                              ['what', 'which', 'where', 'when', 'how', 'why', 'who', 'was', 'were', 'did', 'does']]
+            if important_words:
+                result = ' '.join(important_words[:5])  # Take up to 5 important words
+            else:
+                result = user_input  # Fallback to original question
+                
+        # Add date filter for future-dated questions
+        if '2025' in user_input and '2025' not in result:
+            result += ' 2025'
+            
+        print(f"Decomposed query: {result}")
         return result
     except Exception as e:
-        print(f"Error generating search query: {e}")
-        return user_input  # Fallback to using the original input as search query
+        print(f"Error decomposing query: {e}")
+        # Create a simple fallback query by extracting key terms
+        words = user_input.split()
+        important_words = [w for w in words if len(w) > 3 and w.lower() not in 
+                          ['what', 'which', 'where', 'when', 'how', 'why', 'who', 'was', 'were', 'did', 'does']]
+        if important_words:
+            fallback_query = ' '.join(important_words[:5])
+        else:
+            fallback_query = user_input
+            
+        if '2025' in user_input and '2025' not in fallback_query:
+            fallback_query += ' 2025'
+            
+        print(f"Using fallback query: {fallback_query}")
+        return fallback_query
 
 def search_web(query):
     search_results = []
-    query += " after:2025-01-01"
+    # Add future date filter
+    if '2025' not in query:
+        query += " 2025"
+    
+    print(f"---SEARCH DEBUG--- Final search query: \"{query}\"")
+    print(f"---SEARCH DEBUG--- Starting search with timeout=15s")
+    
     try:
+        # Add delay and randomization to avoid rate limits
+        delay = random.uniform(2.0, 5.0)
+        print(f"---SEARCH DEBUG--- Waiting {delay:.2f}s before search to avoid rate limits")
+        time.sleep(delay)
+        
         # Add timeout for search to prevent hanging
-        search_generator = search(query, num_results=10, timeout=10)
+        print(f"---SEARCH DEBUG--- Creating search generator")
+        search_generator = search(query, num_results=5, timeout=15)
         
         # Use a timeout to prevent hanging
         import signal
@@ -71,30 +139,78 @@ def search_web(query):
         
         # Set the timeout
         signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(15)  # 15 second timeout
+        signal.alarm(20)  # 20 second timeout
+        print(f"---SEARCH DEBUG--- Set global timeout alarm for 20s")
         
         try:
+            print(f"---SEARCH DEBUG--- Starting to iterate through search results")
+            result_count = 0
             for url in search_generator:
                 if url:
+                    print(f"---SEARCH DEBUG--- Found URL: {url}")
                     search_results.append(url)
+                    result_count += 1
+                else:
+                    print(f"---SEARCH DEBUG--- Received empty URL result")
                 if len(search_results) == 3:
+                    print(f"---SEARCH DEBUG--- Reached target of 3 URLs, stopping search")
                     break
             
             # Cancel the timeout
             signal.alarm(0)
+            print(f"---SEARCH DEBUG--- Successfully completed search with {result_count} results")
         except TimeoutException:
-            print("Search operation timed out, proceeding with results found so far")
+            print("---SEARCH DEBUG--- Search operation timed out after 20s, proceeding with results found so far")
+            print(f"---SEARCH DEBUG--- Collected {len(search_results)} results before timeout")
+        except requests.exceptions.HTTPError as e:
+            error_code = str(e).split()[0] if str(e).split() else "unknown"
+            print(f"---SEARCH DEBUG--- HTTP error during search: {error_code} - {str(e)}")
+            if '429' in str(e):
+                print("---SEARCH DEBUG--- Rate limit (429) detected, will wait 30s before next request")
+                time.sleep(30)  # Wait longer on rate limit
         except Exception as e:
-            print(f"Error during search iteration: {e}")
+            print(f"---SEARCH DEBUG--- Unexpected error during search iteration: {type(e).__name__}: {str(e)}")
         
     except Exception as e:
-        print(f"Error in web search: {e}")
+        print(f"---SEARCH DEBUG--- Fatal error in web search: {type(e).__name__}: {str(e)}")
     
-    # If no results, return empty list but don't hang
-    print(f"Found {len(search_results)} search results")
+    print(f"---SEARCH DEBUG--- Search completed with {len(search_results)} results: {search_results}")
     return search_results
 
-def truncate_content(content, max_tokens):
+def evaluate_search_results(urls, user_query):
+    """
+    Evaluates retrieved results based on relevance, timeliness, and source authority
+    Returns a list of scored urls (url, score) sorted by score
+    """
+    evaluated_results = []
+    
+    for url in urls:
+        # Initial score is 1.0
+        score = 1.0
+        
+        # Simple heuristics for evaluation:
+        # Domain authority (simple approach)
+        if '.gov' in url or '.edu' in url:
+            score += 0.3
+        if 'news' in url or 'wikipedia' in url:
+            score += 0.2
+            
+        # Relevance based on URL keywords match
+        query_keywords = user_query.lower().split()
+        url_lower = url.lower()
+        keyword_matches = sum(1 for keyword in query_keywords if keyword in url_lower)
+        score += 0.1 * keyword_matches
+        
+        # Add to results
+        evaluated_results.append((url, score))
+    
+    # Sort by score, descending
+    evaluated_results.sort(key=lambda x: x[1], reverse=True)
+    
+    # Return sorted URLs
+    return [url for url, _ in evaluated_results]
+
+def truncate_content(content, max_tokens, tokenizer):
     """Truncate content to fit within token limit"""
     tokens = tokenizer.encode(content)
     if len(tokens) <= max_tokens:
@@ -109,18 +225,32 @@ def truncate_content(content, max_tokens):
 def extract_main_content(url):
     try:
         # Add timeout to requests to prevent hanging
-        response = requests.get(url, verify=False, timeout=10)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(url, verify=False, timeout=15, headers=headers)
         soup = BeautifulSoup(response.content, 'html.parser')
-        paragraphs = soup.find_all('p')
-        main_content = ' '.join([para.get_text() for para in paragraphs])
         
-        # Limit content size to avoid token overflow - more aggressive truncation
-        content_tokens = len(tokenizer.encode(main_content))
+        # Try to find the main content
+        article = soup.find('article')
+        if article:
+            # If there's an article element, use that
+            main_content = article.get_text()
+        else:
+            # Otherwise use paragraphs
+            paragraphs = soup.find_all('p')
+            main_content = ' '.join([para.get_text() for para in paragraphs])
+        
+        # Clean up the content
+        main_content = re.sub(r'\s+', ' ', main_content).strip()
+        
+        # Limit content size to avoid token overflow
+        content_tokens = len(gen_tokenizer.encode(main_content))
         max_allowed = MAX_TOKENS // 4  # Even smaller chunk per source to be safe
         
         if content_tokens > max_allowed:
             print(f"Content too large ({content_tokens} tokens), truncating to {max_allowed}...")
-            return truncate_content(main_content, max_allowed)
+            return truncate_content(main_content, max_allowed, gen_tokenizer)
         
         return main_content
     except requests.exceptions.Timeout:
@@ -130,90 +260,138 @@ def extract_main_content(url):
         print(f"Error extracting content from {url}: {e}")
         return ""
 
-def generate_response(user_input, main_contents):
-    # More aggressive content limitation
+def generate_response_with_rag(user_input, main_contents):
+    """
+    Synthesizes the original query with retrieved search results using a generation model
+    """
     if len(main_contents) > 2:
         print("Too many content sources, limiting to top 2")
         main_contents = main_contents[:2]
     
     # Estimate token usage and limit content if needed
     total_content = "\n\n".join(main_contents)
-    content_tokens = len(tokenizer.encode(total_content))
+    content_tokens = len(gen_tokenizer.encode(total_content))
     
     max_content_tokens = MAX_TOKENS - TOKEN_MARGIN
     if content_tokens > max_content_tokens:
         print(f"Warning: Content too large ({content_tokens} tokens), truncating to {max_content_tokens}...")
-        # Simple truncation strategy - reduce each content proportionally
+        # Reduce each content proportionally
         ratio = max_content_tokens / content_tokens
         
         truncated_contents = []
         for content in main_contents:
-            content_tokens = len(tokenizer.encode(content))
+            content_tokens = len(gen_tokenizer.encode(content))
             target_tokens = max(100, int(content_tokens * ratio))
-            truncated_contents.append(truncate_content(content, target_tokens))
+            truncated_contents.append(truncate_content(content, target_tokens, gen_tokenizer))
         
         main_contents = truncated_contents
         total_content = "\n\n".join(main_contents)
     
     # Final check to ensure we're under the limit
-    if len(tokenizer.encode(total_content)) > max_content_tokens:
+    if len(gen_tokenizer.encode(total_content)) > max_content_tokens:
         print("Content still too large after truncation, using more aggressive approach")
-        total_content = truncate_content(total_content, max_content_tokens)
+        total_content = truncate_content(total_content, max_content_tokens, gen_tokenizer)
     
-    # Keep prompt simple and short
-    System_prompt = f"Based on this web content, answer the user's question:"
+    # Simplified prompt for better response extraction
+    System_prompt = "Answer this question using the provided information:"
     
-    # Check final prompt size
-    prompt = f'{System_prompt}\n\n{total_content}\n\nQuestion: {user_input}'
-    tokens = len(tokenizer.encode(prompt))
-    print(f"Final prompt length: {tokens} tokens")
+    prompt = f"{System_prompt}\n\nInformation:\n{total_content}\n\nQuestion: {user_input}\n\nAnswer:"
+    tokens = len(gen_tokenizer.encode(prompt))
+    print(f"RAG prompt length: {tokens} tokens")
     
     # Last-resort truncation if still too long
     if tokens > MAX_TOKENS:
-        available_tokens = MAX_TOKENS - len(tokenizer.encode(f'{System_prompt}\n\nQuestion: {user_input}')) - 100
+        available_tokens = MAX_TOKENS - len(gen_tokenizer.encode(f'{System_prompt}\n\nQuestion: {user_input}\n\nAnswer:')) - 100
         if available_tokens > 200:  # Only proceed if we have enough space for useful content
             print(f"Final truncation to {available_tokens} tokens for content")
-            total_content = truncate_content(total_content, available_tokens)
-            prompt = f'{System_prompt}\n\n{total_content}\n\nQuestion: {user_input}'
+            total_content = truncate_content(total_content, available_tokens, gen_tokenizer)
+            prompt = f"{System_prompt}\n\nInformation:\n{total_content}\n\nQuestion: {user_input}\n\nAnswer:"
         else:
             # Fall back to no RAG if we can't fit content
             print("Not enough space for RAG content, falling back to direct question answering")
-            return generate_response_no_RAG(user_input)
+            return generate_response_no_rag(user_input)
     
     try:
-        response = pipeline(
+        response = gen_pipeline(
             prompt,
-            max_new_tokens=1000,
+            max_new_tokens=200,
             repetition_penalty=1.05,
         )
-        response = response[0]['generated_text']
-        result = response.split('</s>')[1].strip()
+        generated_text = response[0]['generated_text']
+        
+        # Try several extraction patterns
+        if "Answer:" in generated_text:
+            result = generated_text.split("Answer:")[1].strip()
+            if "</s>" in result:
+                result = result.split("</s>")[0].strip()
+        elif user_input in generated_text:
+            parts = generated_text.split(user_input)
+            if len(parts) > 1:
+                result = parts[1].strip()
+                if "</s>" in result:
+                    result = result.split("</s>")[0].strip()
+        else:
+            # Fallback to getting the last part of the text
+            result = generated_text.replace(prompt, "").strip()
+            if "</s>" in result:
+                result = result.split("</s>")[0].strip()
+                
+        # Further cleanup
+        result = result.strip()
+        if not result:
+            result = "Unable to generate a clear answer from content."
+            
         return result
     except Exception as e:
         print(f"Error generating response with RAG: {e}")
         return "Error generating response with RAG."
 
-def generate_response_no_RAG(user_input):
+def generate_response_no_rag(user_input):
+    """
+    Generates a response without RAG using just the model's knowledge
+    """
+    # Simplified prompt for better response extraction
     System_prompt = "Answer this question concisely:"
-    prompt = f'{System_prompt} {user_input}'
+    prompt = f"{System_prompt}\n\nQuestion: {user_input}\n\nAnswer:"
     
-    tokens = len(tokenizer.encode(prompt))
-    print(f"Prompt length: {tokens} tokens")
+    tokens = len(gen_tokenizer.encode(prompt))
+    print(f"No-RAG prompt length: {tokens} tokens")
     
     if tokens > MAX_TOKENS:
         print(f"Warning: Input too long ({tokens} tokens), truncating...")
-        # Truncate the input to fit within token limits
-        truncated_input = tokenizer.decode(tokenizer.encode(user_input)[:MAX_TOKENS-100])
-        prompt = f'{System_prompt} {truncated_input}'
+        truncated_input = gen_tokenizer.decode(gen_tokenizer.encode(user_input)[:MAX_TOKENS-150])
+        prompt = f"{System_prompt}\n\nQuestion: {truncated_input}\n\nAnswer:"
     
     try:
-        response = pipeline(
+        response = gen_pipeline(
             prompt,
-            max_new_tokens=1000,
+            max_new_tokens=200,
             repetition_penalty=1.05,
         )
-        response = response[0]['generated_text']
-        result = response.split('</s>')[1].strip()
+        generated_text = response[0]['generated_text']
+        
+        # Try several extraction patterns
+        if "Answer:" in generated_text:
+            result = generated_text.split("Answer:")[1].strip()
+            if "</s>" in result:
+                result = result.split("</s>")[0].strip()
+        elif user_input in generated_text:
+            parts = generated_text.split(user_input)
+            if len(parts) > 1:
+                result = parts[1].strip()
+                if "</s>" in result:
+                    result = result.split("</s>")[0].strip()
+        else:
+            # Fallback to getting the last part of the text
+            result = generated_text.replace(prompt, "").strip()
+            if "</s>" in result:
+                result = result.split("</s>")[0].strip()
+                
+        # Further cleanup
+        result = result.strip()
+        if not result:
+            result = "Unable to generate a response."
+            
         return result
     except Exception as e:
         print(f"Error generating response without RAG: {e}")
@@ -227,11 +405,12 @@ def read_test_dataset(file_path):
     questions = []
     matches = re.findall(r'\*\*Question \d+: (.*?)\*\*\n Correct Answer: (.*?)\n Potential Incorrect Answer: (.*?)\n', content, re.DOTALL)
     
-    for match in matches:
+    for i, match in enumerate(matches):
         question_text = match[0].strip()
         correct_answer = match[1].strip()
         incorrect_answer = match[2].strip()
         questions.append({
+            "id": f"Question {i+1}",
             "question": question_text,
             "correct_answer": correct_answer,
             "incorrect_answer": incorrect_answer
@@ -239,164 +418,131 @@ def read_test_dataset(file_path):
     
     return questions
 
-def process_question(question_data, output_dir):
-    """Process a single question and save results to a file"""
-    user_input = question_data["question"]
-    
-    # Fix the ID extraction logic that was causing the error
-    if "id" in question_data:
-        question_id = question_data["id"].replace("Question ", "")
-    else:
-        question_id = "unknown"
-    
-    output_file = os.path.join(output_dir, f"question_{question_id}_results.txt")
-    
-    # Check if this question was already processed
-    if os.path.exists(output_file):
-        print(f"Question {question_id} already processed, skipping...")
-        return
-    
-    print("\n\n\n")
-    print(f"Question: {user_input}")
-    print(f"Correct Answer: {question_data['correct_answer']}")
-    
-    results = []
-    results.append(f"Question: {user_input}")
-    results.append(f"Correct Answer: {question_data['correct_answer']}")
-    
-    # Generate search query with timeout protection
-    print("Generating query...")
-    try:
-        import signal
-        class TimeoutException(Exception): pass
+def process_questions(questions, output_file):
+    """Process all questions and save results to a CSV file"""
+    # Create CSV file and write header
+    with open(output_file, 'w', newline='') as csvfile:
+        fieldnames = ['Question ID', 'Question', 'Correct Answer', 'No-RAG Answer', 'RAG Answer', 'Search Query', 'References']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
         
-        def timeout_handler(signum, frame):
-            raise TimeoutException("Operation timed out")
-        
-        # Set the timeout for query generation
-        signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(30)  # 30 second timeout
-        
-        search_query = generate_search_query(user_input)
-        
-        # Cancel the timeout
-        signal.alarm(0)
-    except TimeoutException:
-        print("Query generation timed out, using original question")
-        search_query = user_input
-    except Exception as e:
-        print(f"Error in query generation: {e}, using original question")
-        search_query = user_input
-    
-    results.append(f"Search query: {search_query}")
-    
-    # Generate response without RAG with timeout protection
-    print("Generating response with no RAG...")
-    try:
-        signal.alarm(60)  # 60 second timeout for model inference
-        answer = generate_response_no_RAG(user_input)
-        signal.alarm(0)
-    except TimeoutException:
-        print("Model inference timed out for no-RAG response")
-        answer = "Response generation timed out."
-    except Exception as e:
-        print(f"Error in no-RAG generation: {e}")
-        answer = f"Error generating response: {str(e)}"
-    
-    results.append(f"Model's response with no RAG:\n{answer}")
-    
-    # Search the web with built-in timeout
-    print("Searching...")
-    search_results = search_web(search_query)
-    results.append(f"Search results: {', '.join(search_results)}")
-    
-    # Extract content with built-in timeout
-    print("Extracting main content...")
-    main_contents = []
-    for url in search_results:
-        main_content = extract_main_content(url)
-        if main_content:  # Only add if content was extracted
-            main_contents.append(main_content)
-    
-    # Generate RAG response if we have content
-    if main_contents:
-        print("Generating final response with RAG...")
-        try:
-            signal.alarm(60)  # 60 second timeout for RAG inference
-            response = generate_response(user_input, main_contents)
-            signal.alarm(0)
-        except TimeoutException:
-            print("Model inference timed out for RAG response")
-            response = "RAG response generation timed out."
-        except Exception as e:
-            print(f"Error in RAG generation: {e}")
-            response = f"Error generating RAG response: {str(e)}"
-        
-        results.append(f"Final response with RAG:\n{response}")
-    else:
-        results.append("No web content found for RAG")
-    
-    # Save results to file
-    with open(output_file, 'w') as f:
-        f.write("\n\n".join(results))
-    
-    # Print results
-    print("########################################")
-    print(f"User input: {user_input}")
-    print(f"Correct Answer: {question_data['correct_answer']}")
-    print(f"Search query: {search_query}\n")
-    print(f"Model's response with no RAG:\n{answer}\n\n")
-    
-    if main_contents:
-        print(f"Final response with RAG:\n{response}\n\n")
-    else:
-        print("No web content found for RAG\n\n")
-        
-    print(f"Reference: {search_results}")
-    print("########################################")
+        # Process each question
+        for question_data in tqdm(questions):
+            try:
+                question_id = question_data["id"]
+                user_input = question_data["question"]
+                
+                print(f"\nProcessing {question_id}: {user_input}")
+                
+                # First, decompose the query
+                print(f"---QUERY DEBUG--- Decomposing query for: {user_input}")
+                search_query = decompose_query(user_input)
+                print(f"---QUERY DEBUG--- Final search terms: \"{search_query}\"")
+                
+                # Generate response without RAG
+                no_rag_answer = generate_response_no_rag(user_input)
+                print(f"No-RAG answer: {no_rag_answer}")
+                
+                # Search the web with exponential backoff for rate limits
+                max_retries = 3
+                print(f"---SEARCH DEBUG--- Starting search process with max_retries={max_retries}")
+                
+                for retry in range(max_retries):
+                    print(f"---SEARCH DEBUG--- Search attempt {retry+1}/{max_retries}")
+                    search_results = search_web(search_query)
+                    
+                    if search_results:
+                        print(f"---SEARCH DEBUG--- Found {len(search_results)} results, proceeding")
+                        break
+                    elif retry == max_retries - 1:
+                        print(f"---SEARCH DEBUG--- All {max_retries} attempts failed, giving up")
+                        break
+                    else:
+                        wait_time = 10 * (2 ** retry)  # Exponential backoff: 10, 20, 40 seconds
+                        print(f"---SEARCH DEBUG--- No search results on attempt {retry+1}, retrying after {wait_time} seconds...")
+                        time.sleep(wait_time)
+                
+                # Evaluate search results
+                print(f"---SEARCH DEBUG--- Evaluating {len(search_results)} search results")
+                evaluated_results = evaluate_search_results(search_results, user_input)
+                print(f"---SEARCH DEBUG--- After evaluation: {len(evaluated_results)} results")
+                
+                # Extract content
+                main_contents = []
+                print(f"---CONTENT DEBUG--- Extracting content from {len(evaluated_results)} URLs")
+                
+                for i, url in enumerate(evaluated_results):
+                    print(f"---CONTENT DEBUG--- Extracting from URL {i+1}/{len(evaluated_results)}: {url}")
+                    main_content = extract_main_content(url)
+                    content_size = len(main_content) if main_content else 0
+                    if main_content:
+                        print(f"---CONTENT DEBUG--- Successfully extracted {content_size} chars from URL {i+1}")
+                        main_contents.append(main_content)
+                    else:
+                        print(f"---CONTENT DEBUG--- Failed to extract content from URL {i+1}")
+                
+                # Generate RAG response if we have content
+                if main_contents:
+                    print(f"---RAG DEBUG--- Generating RAG response with {len(main_contents)} content sources")
+                    rag_answer = generate_response_with_rag(user_input, main_contents)
+                    print(f"RAG answer: {rag_answer}")
+                else:
+                    rag_answer = "No web content found for RAG"
+                    print(f"---RAG DEBUG--- No content available for RAG generation")
+                    print("No web content found for RAG")
+                
+                # Write results to CSV
+                print(f"---OUTPUT DEBUG--- Writing results to CSV for question {question_id}")
+                writer.writerow({
+                    'Question ID': question_id,
+                    'Question': user_input,
+                    'Correct Answer': question_data['correct_answer'],
+                    'No-RAG Answer': no_rag_answer,
+                    'RAG Answer': rag_answer,
+                    'Search Query': search_query,
+                    'References': ', '.join(search_results)
+                })
+                
+                # Flush to save progress
+                csvfile.flush()
+                print(f"---OUTPUT DEBUG--- Results saved to CSV")
+                
+                # Add random delay between questions to avoid rate limiting
+                delay = random.uniform(5.0, 12.0)  # Increased delay to reduce rate limiting
+                print(f"---RATE LIMIT--- Waiting {delay:.1f} seconds before next question...")
+                time.sleep(delay)
+                
+            except Exception as e:
+                print(f"---ERROR--- Error processing question {question_data['id']}: {type(e).__name__}: {str(e)}")
+                
+                # Write error to CSV
+                writer.writerow({
+                    'Question ID': question_data['id'],
+                    'Question': question_data['question'],
+                    'Correct Answer': question_data['correct_answer'],
+                    'No-RAG Answer': f"Error: {str(e)}",
+                    'RAG Answer': f"Error: {str(e)}",
+                    'Search Query': "",
+                    'References': ""
+                })
+                csvfile.flush()
+                print(f"---ERROR--- Error details written to CSV")
 
-# Create output directory if it doesn't exist
-output_dir = "question_results"
-os.makedirs(output_dir, exist_ok=True)
-
-print("RAG demo ready. Processing test dataset in batches...")
-
-# Read questions from the test dataset
-test_questions = read_test_dataset("Test dataset.md")
-print(f"Loaded {len(test_questions)} questions from dataset")
-
-# Add question IDs for tracking
-for i, question in enumerate(test_questions):
-    question["id"] = f"Question {i+1}"
-
-# Process questions in batches to avoid memory issues
-BATCH_SIZE = 5  # Process 5 questions at a time
-for i in range(0, len(test_questions), BATCH_SIZE):
-    batch = test_questions[i:i+BATCH_SIZE]
-    print(f"\nProcessing batch {i//BATCH_SIZE + 1} of {(len(test_questions)-1)//BATCH_SIZE + 1}")
+def main():
+    print("RAG system starting...")
     
-    for question_data in tqdm(batch):
-        try:
-            # Set a global timeout for the entire question processing
-            import signal
-            
-            def global_timeout_handler(signum, frame):
-                print(f"Processing question {question_data.get('id', 'unknown')} timed out, moving to next")
-                raise TimeoutException("Question processing timed out")
-            
-            signal.signal(signal.SIGALRM, global_timeout_handler)
-            signal.alarm(180)  # 3 minute timeout per question
-            
-            process_question(question_data, output_dir)
-            
-            # Cancel the timeout
-            signal.alarm(0)
-            
-            # Small delay to avoid rate limiting
-            time.sleep(2)
-        except Exception as e:
-            print(f"Error processing question {question_data.get('id', 'unknown')}: {e}")
-            # Continue with next question
+    # Read the test dataset
+    test_data_path = "Test dataset.md"
+    output_file = "rag_evaluation_results.csv"
+    
+    # Read questions
+    questions = read_test_dataset(test_data_path)
+    print(f"Loaded {len(questions)} questions from dataset")
+    
+    # Process all questions
+    process_questions(questions, output_file)
+    
+    print(f"\nRAG evaluation completed! Results saved to {output_file}")
 
-print("\nRAG demo completed successfully!")
-print(f"Results saved to {output_dir}/")
+if __name__ == "__main__":
+    main()
